@@ -10,6 +10,7 @@ import { TaskDecomposer } from '../features/task-decomposer.js';
 import { MultiServerMCPClient } from '../features/mcp/client.js';
 import readline from 'readline';
 import chalk from 'chalk';
+import figlet from 'figlet';
 
 export async function interactiveMode(mcpClient: MultiServerMCPClient): Promise<void> {
   const config = await ConfigManager.load();
@@ -22,10 +23,34 @@ export async function interactiveMode(mcpClient: MultiServerMCPClient): Promise<
   const taskDecomposer = new TaskDecomposer(modelManager, connectionManager);
   const commandTranslator = new CommandTranslator(fileOps, shellOps, modelManager, mcpClient);
   const commandExecutor = new CommandExecutor(fileOps, shellOps, modelManager, mcpClient);
-  const smartInteraction = new SmartInteraction(taskDecomposer, commandTranslator, commandExecutor, modelManager, mcpClient);
+  const smartInteraction = new SmartInteraction(
+    taskDecomposer,
+    commandTranslator,
+    commandExecutor,
+    modelManager,
+    mcpClient,
+    connectionManager
+  );
 
-  logger.info('欢迎使用 wx-cli ---- 开源、纯净的智能CLI！');
+  console.clear();
+  
+  const banner = await new Promise<string>((resolve) => {
+    figlet.text('wx-cli', { font: 'Standard' }, (err, data) => {
+      if (err || !data) {
+        resolve('wx-cli');
+      } else {
+        resolve(data);
+      }
+    });
+  });
+  
+  console.log(chalk.cyan(banner));
+  console.log(chalk.bold.cyan('🤖 AI 驱动 · 📋 智能规划 · 🔌 MCP 集成'));
+  console.log('');
+
+  logger.info('欢迎使用 wx-cli - 开源、纯净的智能 CLI 工具！');
   logger.info('输入 /help 查看可用命令');
+  console.log('');
 
   const rl = readline.createInterface({
     input: process.stdin,

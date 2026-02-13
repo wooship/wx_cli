@@ -57,14 +57,9 @@ export class CommandExecutor {
         case 'shellOps':
           const shellResult = await this.executeShellCommand(command);
           result.output = shellResult;
-          const verification = await this.verifyShellCommand(command, shellResult);
-          result.verification = verification;
-          if (verification.verified) {
-            result.success = verification.isSuccess;
-            if (!result.success) result.error = verification.reason;
-          } else {
-            result.success = shellResult.success;
-            if (!result.success) result.error = shellResult.stderr || '命令执行失败';
+          result.success = shellResult.success;
+          if (!shellResult.success) {
+            result.error = shellResult.stderr || '命令执行失败';
           }
           break;
         case 'modelManager':
@@ -78,9 +73,8 @@ export class CommandExecutor {
         default:
           throw new Error(`未知的执行器: ${command.executor}`);
       }
-      if (!result.verification?.verified) {
-        if (!result.success) 
-          logger.error(`✗ 执行失败`);
+      if (!result.success) {
+        logger.error(`✗ 执行失败`);
       }
     } catch (error: any) {
       result.success = false;
@@ -171,21 +165,6 @@ export class CommandExecutor {
     const message = command.operation as string;
     const messages = [{ role: 'user' as const, content: message }];
     return await this.modelManager.sendMessage(messages);
-  }
-
-  private async verifyShellCommand(command: Command, result: CommandResult): Promise<VerificationResult> {
-    try {
-        const prompt = `你是一个智能命令行助手。请根据用户的意图和命令执行结果，判断命令是否成功执行并达到了预期目标。\n\n【用户意图】\n${command.description}\n\n【执行命令】\n${result.command}\n\n【执行结果】\nExit Code: ${result.exitCode}\nStdout:\n${result.stdout ? result.stdout.slice(0, 1000) : '(empty)'}\nStderr:\n${result.stderr ? result.stderr.slice(0, 1000) : '(empty)'}\n\n请严格通过 JSON 格式返回分析结果：\n{\n  "isSuccess": boolean,\n  "reason": "判断理由",\n  "suggestion": "如果失败，给出建议"\n}`;
-        const response = await this.modelManager.sendMessage([{ role: 'user', content: prompt }]);
-        const content = response.content.replace(/```json/g, '').replace(/```/g, '').trim();
-        const analysis = JSON.parse(content);
-        if (analysis.isSuccess) logger.info(`✓ 结果校验成功: ${analysis.reason}`);
-        else logger.warn(`✗ 结果校验失败: ${analysis.reason}`);
-        return { verified: true, ...analysis };
-    } catch (error) {
-        logger.error('命令执行结果校验失败:', error);
-        return { verified: false, isSuccess: result.success, reason: 'AI校验失败，仅基于退出代码判断' };
-    }
   }
 
   isCriticalOperation(command: Command): boolean {

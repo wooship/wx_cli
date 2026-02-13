@@ -1,6 +1,8 @@
 import OpenAI from 'openai';
 import { AppConfig, ModelConfig } from './config.js';
 import { logger } from '../utils/logger.js';
+import fs from 'fs/promises';
+import path from 'path';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -48,9 +50,72 @@ export interface ModelAdapter {
 
 export class ModelManager {
   private adapters: Map<string, ModelAdapter> = new Map();
+  private enableChatLogging: boolean = true;
+  private chatLogDir: string = path.join(process.cwd(), '.wx-cli', 'conversations');
 
   constructor(private config: AppConfig) {
     this.initializeAdapters();
+    this.setupChatLogging();
+  }
+
+  private async setupChatLogging(): Promise<void> {
+    try {
+      await fs.mkdir(this.chatLogDir, { recursive: true });
+
+      const files = await fs.readdir(this.chatLogDir);
+      const jsonFiles = files.filter(f => f.endsWith('.json'));
+      
+      for (const file of jsonFiles) {
+        await fs.unlink(path.join(this.chatLogDir, file));
+      }
+      
+      if (jsonFiles.length > 0) {
+        logger.debug(`已清理 ${jsonFiles.length} 个旧的对话日志文件`);
+      }
+    } catch (error) {
+      logger.warn(`无法创建对话日志目录: ${this.chatLogDir}`);
+      this.enableChatLogging = false;
+    }
+  }
+
+  private async saveInteraction(
+    messages: ChatMessage[],
+    response: ModelResponse,
+    options: ModelOptions = {},
+    error?: any
+  ): Promise<void> {
+    if (!this.enableChatLogging) return;
+
+    try {
+      const timestamp = new Date().toISOString().replace(/[:T.]/g, '-').slice(0, -1);
+      const filename = `conversation-${timestamp}.json`;
+      const filepath = path.join(this.chatLogDir, filename);
+
+      const logData = {
+        timestamp: new Date().toISOString(),
+        model: options.model || this.config.models.default,
+        options: {
+          temperature: options.temperature,
+          maxTokens: options.maxTokens,
+          stream: options.stream,
+        },
+        messages: messages.map(msg => ({
+          role: msg.role,
+          content: msg.content,
+          name: msg.name,
+        })),
+        response: {
+          content: response.content,
+          usage: response.usage,
+          error: error ? error.message : undefined,
+        },
+      };
+
+      await fs.writeFile(filepath, JSON.stringify(logData, null, 2), 'utf-8');
+      logger.debug(`对话已保存到: ${filepath}`);
+    } catch (error) {
+      logger.error('保存对话失败:', error);
+    }
   }
 
   private initializeAdapters(): void {
@@ -83,8 +148,15 @@ export class ModelManager {
     }
 
     try {
-      return await adapter.sendMessage(messages, options);
+      const response = await adapter.sendMessage(messages, options);
+      await this.saveInteraction(messages, response, options);
+      return response;
     } catch (error) {
+      const errorResponse: ModelResponse = {
+        content: '',
+        usage: undefined
+      };
+      await this.saveInteraction(messages, errorResponse, options, error);
       logger.error(`模型调用失败 (${modelName}):`, error);
       throw error;
     }
@@ -99,8 +171,26 @@ export class ModelManager {
     }
 
     try {
-      yield* adapter.streamMessage(messages, { ...options, stream: true });
+      let fullContent = '';
+      const chunks: string[] = [];
+
+      for await (const chunk of adapter.streamMessage(messages, { ...options, stream: true })) {
+        chunks.push(chunk);
+        fullContent += chunk;
+        yield chunk;
+      }
+
+      const response: ModelResponse = {
+        content: fullContent,
+        usage: undefined
+      };
+      await this.saveInteraction(messages, response, { ...options, stream: true });
     } catch (error) {
+      const errorResponse: ModelResponse = {
+        content: '',
+        usage: undefined
+      };
+      await this.saveInteraction(messages, errorResponse, { ...options, stream: true }, error);
       logger.error(`模型流式调用失败 (${modelName}):`, error);
       throw error;
     }

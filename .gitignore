@@ -86,3 +86,6 @@ coverage/
 tmp/
 temp/
 *.tmp
+
+# wx-cli runtime data
+.wx-cli/

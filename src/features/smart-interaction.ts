@@ -1,7 +1,9 @@
 import { CommandTranslator, TranslationResult, Command } from './command-translator.js';
 import { CommandExecutor, BatchExecutionResult, ExecutionResult } from './command-executor.js';
 import { TaskDecomposer } from './task-decomposer.js';
-import { Intent, Action, SubTask, TaskContext, SubTaskResult, TaskSummary, TaskExecutionStatus, TaskPlan } from './types.js';
+import { SubTaskExecutor, SubTaskExecutionResult } from './subtask-executor.js';
+import { ConnectionManager } from './mcp/connection.js';
+import { Intent, Action, SubTask, TaskContext, TaskSummary, TaskExecutionStatus, TaskPlan, ChatMessage } from './types.js';
 import { logger } from '../utils/logger.js';
 import { MultiServerMCPClient } from './mcp/client.js';
 import { ModelManager } from '../core/model.js';
@@ -9,20 +11,10 @@ import readline from 'readline';
 
 export interface InteractionResult {
   input: string;
-  subtasks?: string[];
-  intent: Intent | null;
-  commandTranslations: TranslationResult[];
-  execution: BatchExecutionResult | null;
   success: boolean;
   timestamp: Date;
   duration: number;
-}
-
-export interface InteractionOptions {
-  autoExecute?: boolean;
-  confirmRiskyOperations?: boolean;
-  silent?: boolean;
-  rl?: any;
+  finalMessage: string;
 }
 
 export interface InteractionOptions {
@@ -40,7 +32,8 @@ export class SmartInteraction {
     private commandTranslator: CommandTranslator,
     private commandExecutor: CommandExecutor,
     private modelManager: ModelManager,
-    private mcpClient?: MultiServerMCPClient
+    private mcpClient: MultiServerMCPClient,
+    private connectionManager: ConnectionManager
   ) {
     if (mcpClient && (commandTranslator as any).mcpClient === undefined) {
       (commandTranslator as any).mcpClient = mcpClient;
@@ -51,40 +44,48 @@ export class SmartInteraction {
     const startTime = Date.now();
     const overallResult: InteractionResult = {
       input,
-      intent: null,
-      commandTranslations: [],
-      execution: { results: [], successCount: 0, failureCount: 0, totalDuration: 0 },
       success: false,
       timestamp: new Date(),
-      duration: 0
+      duration: 0,
+      finalMessage: ''
     };
 
     try {
       if (!options.silent) logger.info(`开始处理目标: "${input}"`);
 
+      // 1. 初始化 Context
       const context = this.initializeContext(input);
+
+      // 2. 创建初始计划
       const initialPlan = await this.taskDecomposer.createInitialPlan(input);
       context.pendingTasks = initialPlan.subTasks;
 
       if (!options.silent) this.displayTaskPlan(context);
 
+      // 3. 创建 SubTaskExecutor
+      const subTaskExecutor = new SubTaskExecutor(
+        this.modelManager,
+        this.commandExecutor,
+        this.connectionManager
+      );
+
+      // 4. 执行任务循环
       const maxCycles = 20;
       let cycleCount = 0;
+      let lastGoalCheck: { completed: boolean; message: string } | null = null;
 
       while (cycleCount < maxCycles) {
         cycleCount++;
 
+        // 检查是否还有待执行任务
         if (context.pendingTasks.length === 0) {
-          const goalCheck = await this.taskDecomposer.checkGoalCompleted(context);
-          if (goalCheck.completed) {
-            if (!options.silent) logger.success(`✓ ${goalCheck.message}`);
-            overallResult.success = true;
+          lastGoalCheck = await this.taskDecomposer.checkGoalCompleted(context);
+          if (lastGoalCheck.completed) {
             break;
           } else {
             const additionalTask = await this.taskDecomposer.planNextSubTask(context);
             if (!additionalTask) {
               if (!options.silent) logger.success('✓ 任务已完成');
-              overallResult.success = true;
               break;
             }
             context.pendingTasks.push(additionalTask);
@@ -92,9 +93,11 @@ export class SmartInteraction {
           }
         }
 
+        // 获取下一个任务
         const nextSubTask = context.pendingTasks.shift();
         if (!nextSubTask) continue;
 
+        // 确认高风险操作
         if (options.confirmRiskyOperations && this.isRiskySubTask(nextSubTask)) {
           const confirmed = await this.confirmSubTask(nextSubTask, options.rl);
           if (!confirmed) {
@@ -103,95 +106,76 @@ export class SmartInteraction {
           }
         }
 
-        const subTaskResult = await this.executeSubTask(nextSubTask, context, options);
-        context.completedTasks.push(subTaskResult);
-        context.completedCount++;
+        // 执行子任务
+        const executionResult = await subTaskExecutor.executeSubTask(nextSubTask, context);
+
+        // 更新 Context: 添加聊天记录
+        executionResult.chatMessages.forEach(msg => {
+          context.chatHistory.push(msg);
+        });
         context.lastUpdated = new Date();
 
-        const lastOutput: any = {
-          success: subTaskResult.success
-        };
-        if (subTaskResult.output.data !== undefined) {
-          lastOutput.data = subTaskResult.output.data;
-        }
-        if (subTaskResult.output.stdout !== undefined) {
-          lastOutput.stdout = subTaskResult.output.stdout;
-        }
-        if (subTaskResult.output.stderr !== undefined) {
-          lastOutput.stderr = subTaskResult.output.stderr;
-        }
-        context.lastOutput = lastOutput;
-
-        if (subTaskResult.output.data && typeof subTaskResult.output.data === 'object') {
-          Object.assign(context.accumulatedData, subTaskResult.output.data);
-        }
-
-        if (overallResult.execution) {
-          overallResult.execution.results.push({
-            success: subTaskResult.success,
-            command: this.subTaskToCommand(nextSubTask),
-            output: subTaskResult.output.data || subTaskResult.output,
-            duration: subTaskResult.duration,
-            timestamp: subTaskResult.timestamp
-          });
-          overallResult.execution.totalDuration += subTaskResult.duration;
-          if (subTaskResult.success) {
-            overallResult.execution.successCount++;
-          } else {
-            overallResult.execution.failureCount++;
-          }
-        }
-
-        if (!subTaskResult.success || !subTaskResult.goalMet) {
-          const errorReason = subTaskResult.verification.reason || '执行失败';
-          const suggestion = subTaskResult.verification.suggestion;
-
-          if (!options.silent) logger.warn(`✗ 子任务失败: ${errorReason}`);
-          if (suggestion) {
-            if (!options.silent) logger.info(`建议: ${suggestion}`);
-
-            context.accumulatedSuggestions.push({
-              taskId: subTaskResult.taskId,
-              description: subTaskResult.description,
-              error: errorReason,
-              suggestion,
-              timestamp: new Date()
-            });
+        // 检查是否成功
+        if (!executionResult.success) {
+          if (!options.silent) {
+            logger.warn(`✗ 子任务失败: ${nextSubTask.description}`);
+            // 显示最后的错误消息
+            const errorMsg = executionResult.chatMessages.find(m => m.messageType === 'error');
+            if (errorMsg) {
+              logger.warn(errorMsg.content);
+            }
           }
 
-          context.lastError = {
-            taskId: subTaskResult.taskId,
-            description: subTaskResult.description,
-            error: errorReason,
-            ...(suggestion ? { suggestion } : {})
-          };
+          // 重新规划
+          const errorReason = executionResult.executionResult.error || '执行失败';
+          const lastResult = executionResult.executionResult;
 
           try {
-            const newPlan = await this.taskDecomposer.replanWithFeedback(subTaskResult, context, errorReason, suggestion);
+            const newPlan = await this.taskDecomposer.replanWithFeedback(
+              lastResult as any,
+              context,
+              errorReason
+            );
             context.pendingTasks = newPlan.subTasks;
 
+            // 添加 replan 消息到历史
+            const replanMsg: ChatMessage = {
+              id: this.generateId(),
+              timestamp: new Date(),
+              role: 'system',
+              content: `因失败重新规划: ${errorReason}`,
+              messageType: 'replan'
+            };
+            context.chatHistory.push(replanMsg);
+
             if (!options.silent) {
-              logger.info(`\n🔄 重新规划后续任务，共 ${context.pendingTasks.length} 个`);
+              logger.info(`\n🔄 重新规划，共 ${context.pendingTasks.length} 个任务`);
               this.displayTaskPlan(context);
             }
             continue;
           } catch (replanError) {
-            logger.error('重规划过程中出错:', replanError);
-            if (!options.silent) logger.warn('重规划失败，任务终止');
+            logger.error('重规划失败:', replanError);
+            overallResult.finalMessage = `重规划失败`;
             break;
           }
         }
+
+        if (!options.silent) {
+          logger.info(`✓ 完成: ${nextSubTask.description}`);
+        }
       }
 
-      const summary = await this.generateTaskSummary(context, options.silent);
+      // 5. 生成最终摘要
+      const summary = await this.generateTaskSummary(context, lastGoalCheck);
+
       overallResult.success = summary.status === TaskExecutionStatus.COMPLETED;
       overallResult.duration = Date.now() - startTime;
+      overallResult.finalMessage = summary.finalMessage;
 
       this.history.push(overallResult);
 
       if (!options.silent) {
-        const finalSummary = await this.generateFinalSummary(context);
-        logger.success(`✓ ${finalSummary}`);
+        logger.success(`✓ ${summary.finalMessage}`);
         this.displaySummary(summary);
       }
 
@@ -199,12 +183,13 @@ export class SmartInteraction {
 
     } catch (error: any) {
       if (error instanceof Error) {
-        logger.error(`智能交互处理失败: ${error.message}`, { stack: error.stack });
+        logger.error(`处理失败: ${error.message}`, { stack: error.stack });
       } else {
-        logger.error('智能交互处理失败:', JSON.stringify(error, null, 2));
+        logger.error('处理失败:', JSON.stringify(error, null, 2));
       }
       overallResult.success = false;
       overallResult.duration = Date.now() - startTime;
+      overallResult.finalMessage = `处理失败: ${error instanceof Error ? error.message : String(error)}`;
       return overallResult;
     }
   }
@@ -213,12 +198,9 @@ export class SmartInteraction {
     return {
       originalGoal: input,
       pendingTasks: [],
-      completedTasks: [],
-      accumulatedData: {},
-      completedCount: 0,
+      chatHistory: [],
       startTime: new Date(),
-      lastUpdated: new Date(),
-      accumulatedSuggestions: []
+      lastUpdated: new Date()
     };
   }
 
@@ -228,23 +210,18 @@ export class SmartInteraction {
 
     if (context.pendingTasks.length > 0) {
       logger.info(`待执行任务 (${context.pendingTasks.length} 个):`);
-      logger.info('');
+      logger.info('========================================');
       context.pendingTasks.forEach((task, index) => {
         logger.raw(`  ${index + 1}. ${task.description}`);
       });
     }
 
-    if (context.completedTasks.length > 0) {
-      logger.info('历史任务(3):');
-      context.completedTasks.slice(-3).forEach(task => {
-        if (task.success) {
-          logger.info(`  ✓ ${task.description}`);
-        } else {
-          logger.error(`  ✗ ${task.description}`);
-        }
-      });
-    }
-    logger.info('');
+    // if (context.chatHistory.length > 0) {
+    //   logger.info('');
+    //   logger.info(`聊天记录数: ${context.chatHistory.length}`);
+    // }
+
+    logger.info('========================================');
   }
 
   private isRiskySubTask(subTask: SubTask): boolean {
@@ -258,7 +235,6 @@ export class SmartInteraction {
     logger.warn('\n⚠ 高风险操作需要确认:');
     logger.raw(`  操作: ${subTask.description}`);
     logger.raw(`  类型: ${subTask.type}`);
-    logger.raw(`  参数: ${JSON.stringify(subTask.parameters, null, 2)}`);
 
     return new Promise((resolve) => {
       rl.question('? 是否继续? (y/N) ', (answer: string) => {
@@ -268,168 +244,94 @@ export class SmartInteraction {
     });
   }
 
-  private async executeSubTask(subTask: SubTask, context: TaskContext, options: InteractionOptions = {}): Promise<SubTaskResult> {
-    const startTime = Date.now();
+  private async generateTaskSummary(context: TaskContext, goalCheckResult?: { completed: boolean; message: string } | null): Promise<TaskSummary> {
+    const goalCheck = goalCheckResult ?? await this.taskDecomposer.checkGoalCompleted(context);
 
-    const command = this.subTaskToCommand(subTask, context);
+    const successCount = context.chatHistory.filter(m => m.messageType === 'tool_result' && m.metadata?.success).length;
+    const failureCount = context.chatHistory.filter(m => m.messageType === 'tool_result' && m.metadata?.success === false).length;
 
-    const executionResult = await this.commandExecutor.executeCommand(command);
+    let finalMessage = goalCheck.message || '任务结束';
 
-    const verification: any = executionResult.verification || { verified: false, isSuccess: executionResult.success, reason: '未验证' };
+    if (goalCheck.completed && successCount > 0) {
+      for (let i = context.chatHistory.length - 1; i >= 0; i--) {
+        const msg = context.chatHistory[i];
 
-    if (!verification.verified && subTask.successCriteria) {
-      const llmVerification = await this.verifyWithLLM(subTask, executionResult, context);
-      Object.assign(verification, llmVerification);
-    }
+        if (!msg || msg.messageType !== 'tool_result' || !msg.metadata?.success) {
+          continue;
+        }
 
-    const goalMet = verification.isSuccess && executionResult.success;
+        const content = msg.content;
 
-    return {
-      taskId: subTask.id,
-      description: subTask.description,
-      success: executionResult.success,
-      output: {
-        data: executionResult.output,
-        stdout: executionResult.output?.stdout,
-        stderr: executionResult.output?.stderr,
-        exitCode: executionResult.output?.exitCode,
-        error: executionResult.error
-      } as any,
-      duration: Date.now() - startTime,
-      timestamp: new Date(),
-      verification,
-      goalMet
-    };
-  }
+        if (!content || content.length < 20) {
+          continue;
+        }
 
-  private subTaskToCommand(subTask: SubTask, context?: TaskContext): Command {
-    const command: Command = {
-      type: subTask.type,
-      description: subTask.description,
-      operation: subTask.parameters,
-      executor: subTask.type === 'shell-command' ? 'shellOps' :
-                subTask.type === 'file-operation' ? 'fileOps' :
-                subTask.type === 'mcp-tool' ? 'mcp-tool' : 'modelManager',
-      parameters: subTask.parameters
-    };
+        const skipPattern = /^(工具返回|命令执行|操作执行|AI对话执行|文件操作执行)/;
 
-    return command;
-  }
+        if (skipPattern.test(content)) {
+          continue;
+        }
 
-  private async verifyWithLLM(subTask: SubTask, executionResult: ExecutionResult, context: TaskContext): Promise<any> {
-    const systemPrompt = `你是一个执行结果验证专家。基于子任务的成功标准，判断执行是否达成了目标。
-返回 JSON: { "isSuccess": boolean, "reason": "中文理由（最多50字）" }`;
+        if (content.startsWith('total ') && content.includes('drwxr-xr-x')) {
+          continue;
+        }
 
-    const userPrompt = `验证子任务执行结果：
-子任务目标: ${subTask.description}
-成功标准: ${subTask.successCriteria || '默认基于exitCode判断'}
-执行类型: ${subTask.type}
-执行参数: ${JSON.stringify(subTask.parameters, null, 2)}
-执行结果: ${JSON.stringify(executionResult.output, null, 2)}
-错误信息: ${executionResult.error || '无'}
-累积数据: ${JSON.stringify(context.accumulatedData, null, 2).slice(0, 500)}`;
-
-    try {
-      const response = await this.modelManager.sendMessage([
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ], { temperature: 0.1 });
-
-      const content = response.content.replace(/```json/g, '').replace(/```/g, '').trim();
-      const result = JSON.parse(content);
-
-      if (!result.isSuccess) {
-        result.suggestion = await this.getSuggestionFromLLM(subTask, executionResult, result.reason, context);
+        finalMessage = content;
+        break;
       }
 
-      return { verified: true, ...result };
-    } catch (error) {
-      logger.error('LLM验证失败:', error);
-      return { verified: false, isSuccess: executionResult.success, reason: '验证失败，默认基于执行结果判断' };
+      if (!finalMessage || finalMessage === '任务结束') {
+        finalMessage = await this.generateFinalSummary(context);
+      }
     }
-  }
-
-  private async getSuggestionFromLLM(subTask: SubTask, executionResult: ExecutionResult, errorReason: string, context: TaskContext): Promise<string> {
-    const systemPrompt = `你是一个问题解决专家。基于失败的子任务，给出一个简洁的补救建议（最多30字）。`;
-
-    const userPrompt = `失败的子任务：
-描述: ${subTask.description}
-错误原因: ${errorReason}
-执行结果: ${JSON.stringify(executionResult.output, null, 2)}
-累积数据: ${JSON.stringify(context.accumulatedData, null, 2).slice(0, 300)}`;
-
-    try {
-      const response = await this.modelManager.sendMessage([
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ], { temperature: 0.3 });
-
-      return response.content.trim();
-    } catch (error) {
-      logger.error('生成建议失败:', error);
-      return '无建议';
-    }
-  }
-
-  private async generateTaskSummary(context: TaskContext, silent = false): Promise<TaskSummary> {
-    const goalCheck = await this.taskDecomposer.checkGoalCompleted(context);
 
     return {
       originalGoal: context.originalGoal,
       status: goalCheck.completed ? TaskExecutionStatus.COMPLETED : TaskExecutionStatus.FAILED,
       totalDuration: Date.now() - context.startTime.getTime(),
-      successCount: context.completedTasks.filter(t => t.success).length,
-      failureCount: context.completedTasks.filter(t => !t.success).length,
-      results: context.completedTasks,
-      finalMessage: goalCheck.message || '任务结束'
+      successCount,
+      failureCount,
+      finalMessage
     };
-  }
-
-  private async generateFinalSummary(context: TaskContext): Promise<string> {
-    if (context.completedTasks.length === 0) {
-      return '未执行任何任务';
-    }
-
-    const lastTask = context.completedTasks[context.completedTasks.length - 1];
-    if (!lastTask) {
-      return `已完成：${context.originalGoal}`;
-    }
-
-    const keyResults = context.completedTasks
-      .filter(t => t.success && t.output?.data)
-      .slice(-3)
-      .map(t => t.output?.data)
-      .filter(Boolean);
-
-    const systemPrompt = `你是一个任务执行总结专家。请用简洁的中文（1-2句话）总结任务结果。
-要求：
-- 直接给出用户最关心的核心结果
-- 不要提及执行过程、失败尝试、循环次数等细节
-- 不要使用"已成功完成"、"任务目标已达成"等套话
-- 格式：直接描述结果或者告诉用户想知道的答案`;
-
-    const userPrompt = `用户目标: ${context.originalGoal}
-最后执行结果: ${JSON.stringify(lastTask.output?.data || lastTask, null, 2).slice(0, 500)}
-关键数据: ${keyResults.map(k => JSON.stringify(k)).join('\n')}`;
-
-    try {
-      const response = await this.modelManager.sendMessage([
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ], { temperature: 0.3 });
-
-      return response.content.trim();
-    } catch (error) {
-      return `已完成：${context.originalGoal}`;
-    }
   }
 
   private displaySummary(summary: TaskSummary): void {
     logger.info('\n=== 任务执行汇总 ===');
     logger.info(`最终状态: ${summary.status}`);
     logger.info(`总耗时: ${summary.totalDuration}ms`);
-    logger.info(`完成: ${summary.successCount} | 报错: ${summary.failureCount}`);
+    logger.info(`成功: ${summary.successCount} | 失败: ${summary.failureCount}`);
     logger.info('====================\n');
+  }
+
+  private async generateFinalSummary(context: TaskContext): Promise<string> {
+    const chatHistoryText = context.chatHistory.map(msg => {
+      const role = msg.role === 'user' ? '我' : msg.role === 'assistant' ? 'AI' : '系统';
+      return `${role}: ${msg.content}`;
+    }).join('\n\n');
+
+    const prompt = `你是一个总结专家。用户的目标是: ${context.originalGoal}
+
+请根据执行历史，用简洁的语言向用户汇报最终结果。
+
+执行历史:
+${chatHistoryText}
+
+要求:
+- 直接向用户汇报结果
+- 简洁明了，一两句话
+- 不要重复原始命令输出
+- 如果有具体数据或答案，直接给出`;
+
+    try {
+      const response = await this.modelManager.sendMessage([{ role: 'user', content: prompt }], { temperature: 0.7 });
+      return response.content;
+    } catch (error) {
+      return '任务完成';
+    }
+  }
+
+  private generateId(): string {
+    return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   }
 
   getHistory(): InteractionResult[] {
@@ -449,7 +351,7 @@ export class SmartInteraction {
       }
       this.clearHistory();
     } catch (error: any) {
-      logger.error('智能交互清理失败:', error);
+      logger.error('清理失败:', error);
     }
   }
 }
