@@ -4,6 +4,10 @@
 
 一个简单纯净的 AI 命令行工具，支持 OpenAI API、智能任务规划、MCP（Model Context Protocol）集成和自动化执行。
 
+## 截图
+
+![示例图片](screenshot.png)
+
 ## 核心特性
 
 - 🤖 **AI 驱动**: 基于 OpenAI GPT 模型的智能交互
