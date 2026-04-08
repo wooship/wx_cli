@@ -7,6 +7,7 @@ import { SubTask, TaskContext, ChatMessage } from './types.js';
 export interface SubTaskExecutionResult {
   subtaskId: number;
   success: boolean;
+  reason?: string;
   executionResult: ExecutionResult;
   chatMessages: ChatMessage[];
 }
@@ -49,6 +50,7 @@ export class SubTaskExecutor {
     return {
       subtaskId: subTask.id,
       success,
+      reason: verificationResult.reason,
       executionResult,
       chatMessages
     };
@@ -432,9 +434,19 @@ ${chatHistory}
 
     // 如果工具执行本身失败，不需要 LLM 验证
     if (!execSuccess) {
-      const errorReason = executionResult.output?.isError ?
-        `工具返回错误` :
-        (executionResult.error || '执行失败');
+      let errorReason = executionResult.error || '执行失败';
+      if (executionResult.output?.isError) {
+        let toolErrorDetail = '';
+        if (Array.isArray(executionResult.output.content)) {
+          toolErrorDetail = executionResult.output.content
+            .filter((c: any) => c.type === 'text')
+            .map((c: any) => c.text)
+            .join('; ');
+        } else if (typeof executionResult.output.error === 'string') {
+          toolErrorDetail = executionResult.output.error;
+        }
+        errorReason = toolErrorDetail ? `工具返回错误: ${toolErrorDetail}` : `工具返回错误`;
+      }
 
       const msg: ChatMessage = {
         id: this.generateId(),

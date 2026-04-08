@@ -89,3 +89,4 @@ temp/
 
 # wx-cli runtime data
 .wx-cli/
+\n# sisyphus\n.sisyphus/

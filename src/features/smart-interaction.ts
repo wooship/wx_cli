@@ -118,16 +118,16 @@ export class SmartInteraction {
         // 检查是否成功
         if (!executionResult.success) {
           if (!options.silent) {
-            logger.warn(`✗ 子任务失败: ${nextSubTask.description}`);
-            // 显示最后的错误消息
+            logger.warn(`✗ 子任务失败: ${executionResult.reason || nextSubTask.description}`);
+            // 如果 reason 和 errorMsg 内容不同，则显示最后的错误消息
             const errorMsg = executionResult.chatMessages.find(m => m.messageType === 'error');
-            if (errorMsg) {
+            if (errorMsg && errorMsg.content !== executionResult.reason) {
               logger.warn(errorMsg.content);
             }
           }
 
           // 重新规划
-          const errorReason = executionResult.executionResult.error || '执行失败';
+          const errorReason = executionResult.reason || executionResult.executionResult.error || '执行失败';
           const lastResult = executionResult.executionResult;
 
           try {
